@@ -1,65 +1,51 @@
 import { expect } from "bun:test"
-import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { Effect, Layer } from "effect"
+import { Npm } from "@opencode-ai/core/npm"
+import { Effect } from "effect"
 import path from "path"
 import { pathToFileURL } from "url"
 import { Agent } from "../../src/agent/agent"
-import { InstanceRef } from "../../src/effect/instance-ref"
-import { InstanceLayer } from "../../src/project/instance-layer"
-import { InstanceStore } from "../../src/project/instance-store"
-import { tmpdirScoped } from "../fixture/fixture"
+import { Account } from "../../src/account/account"
+import { Auth } from "../../src/auth"
+import { RuntimeFlags } from "../../src/effect/runtime-flags"
+import { Plugin } from "../../src/plugin"
+import { Provider } from "../../src/provider/provider"
+import { Skill } from "../../src/skill"
+import { AccountTest } from "../fake/account"
+import { AuthTest } from "../fake/auth"
+import { NpmTest } from "../fake/npm"
+import { ProviderTest } from "../fake/provider"
+import { SkillTest } from "../fake/skill"
 import { testEffect } from "../lib/effect"
+import { PLUGIN_AGENT } from "../fixture/agent-plugin.constants"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
-const pluginAgent = {
-  name: "plugin_added",
-  description: "Added by a plugin via the config hook",
-  mode: "subagent",
-} as const
+// `it.instance` skips InstanceBootstrap so LSP / MCP don't spin up — those
+// services hang during scope teardown on Windows and aren't needed
+// to verify plugin → config hook → Agent.list.
+const pluginUrl = pathToFileURL(path.join(import.meta.dir, "..", "fixture", "agent-plugin.ts")).href
 
-const it = testEffect(Layer.mergeAll(Agent.defaultLayer, InstanceLayer.layer, CrossSpawnSpawner.defaultLayer))
+const provider = ProviderTest.fake()
+const it = testEffect(
+  AppNodeBuilder.build(LayerNode.group([Agent.node, Plugin.node]), [
+    [Auth.node, AuthTest.empty],
+    [Account.node, AccountTest.empty],
+    [Npm.node, NpmTest.noop],
+    [Provider.node, provider.layer],
+    [Skill.node, SkillTest.empty],
+    [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: true })],
+  ]),
+)
 
-it.live("plugin-registered agents appear in Agent.list", () =>
-  Effect.gen(function* () {
-    const dir = yield* tmpdirScoped()
-    const pluginFile = path.join(dir, "plugin.ts")
-
-    yield* Effect.promise(async () => {
-      await Promise.all([
-        Bun.write(
-          pluginFile,
-          [
-            "export default async () => ({",
-            "  config: async (cfg) => {",
-            "    cfg.agent = cfg.agent ?? {}",
-            `    cfg.agent[${JSON.stringify(pluginAgent.name)}] = {`,
-            `      description: ${JSON.stringify(pluginAgent.description)},`,
-            `      mode: ${JSON.stringify(pluginAgent.mode)},`,
-            "    }",
-            "  },",
-            "})",
-            "",
-          ].join("\n"),
-        ),
-        Bun.write(
-          path.join(dir, "opencode.json"),
-          JSON.stringify({
-            $schema: "https://opencode.ai/config.json",
-            plugin: [pathToFileURL(pluginFile).href],
-          }),
-        ),
-      ])
-    })
-
-    const agents = yield* InstanceStore.Service.use((store) =>
-      Effect.gen(function* () {
-        const ctx = yield* store.load({ directory: dir })
-        yield* Effect.addFinalizer(() => store.dispose(ctx).pipe(Effect.ignore))
-        return yield* Agent.Service.use((svc) => svc.list()).pipe(Effect.provideService(InstanceRef, ctx))
-      }),
-    )
-    const added = agents.find((agent) => agent.name === pluginAgent.name)
-
-    expect(added?.description).toBe(pluginAgent.description)
-    expect(added?.mode).toBe(pluginAgent.mode)
-  }),
+it.instance(
+  "plugin-registered agents appear in Agent.list",
+  () =>
+    Effect.gen(function* () {
+      yield* Plugin.Service.use((p) => p.init())
+      const agents = yield* Agent.use.list()
+      const added = agents.find((agent) => agent.name === PLUGIN_AGENT.name)
+      expect(added?.description).toBe(PLUGIN_AGENT.description)
+      expect(added?.mode).toBe(PLUGIN_AGENT.mode)
+    }),
+  { config: { plugin: [pluginUrl] } },
 )
